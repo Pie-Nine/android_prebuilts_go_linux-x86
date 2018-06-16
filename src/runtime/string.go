@@ -69,7 +69,7 @@ func concatstring5(buf *tmpBuf, a [5]string) string {
 
 // Buf is a fixed-size buffer for the result,
 // it is not nil if the result does not escape.
-func slicebytetostring(buf *tmpBuf, b []byte) string {
+func slicebytetostring(buf *tmpBuf, b []byte) (str string) {
 	l := len(b)
 	if l == 0 {
 		// Turns out to be a relatively common case.
@@ -77,18 +77,26 @@ func slicebytetostring(buf *tmpBuf, b []byte) string {
 		// you find the indices and convert the subslice to string.
 		return ""
 	}
-	if raceenabled && l > 0 {
+	if raceenabled {
 		racereadrangepc(unsafe.Pointer(&b[0]),
 			uintptr(l),
-			getcallerpc(unsafe.Pointer(&buf)),
+			getcallerpc(),
 			funcPC(slicebytetostring))
 	}
-	if msanenabled && l > 0 {
+	if msanenabled {
 		msanread(unsafe.Pointer(&b[0]), uintptr(l))
 	}
-	s, c := rawstringtmp(buf, l)
-	copy(c, b)
-	return s
+
+	var p unsafe.Pointer
+	if buf != nil && len(b) <= len(buf) {
+		p = unsafe.Pointer(buf)
+	} else {
+		p = mallocgc(uintptr(len(b)), nil, false)
+	}
+	stringStructOf(&str).str = p
+	stringStructOf(&str).len = len(b)
+	memmove(p, (*(*slice)(unsafe.Pointer(&b))).array, uintptr(len(b)))
+	return
 }
 
 // stringDataOnStack reports whether the string's data is
@@ -126,7 +134,7 @@ func slicebytetostringtmp(b []byte) string {
 	if raceenabled && len(b) > 0 {
 		racereadrangepc(unsafe.Pointer(&b[0]),
 			uintptr(len(b)),
-			getcallerpc(unsafe.Pointer(&b)),
+			getcallerpc(),
 			funcPC(slicebytetostringtmp))
 	}
 	if msanenabled && len(b) > 0 {
@@ -175,7 +183,7 @@ func slicerunetostring(buf *tmpBuf, a []rune) string {
 	if raceenabled && len(a) > 0 {
 		racereadrangepc(unsafe.Pointer(&a[0]),
 			uintptr(len(a))*unsafe.Sizeof(a[0]),
-			getcallerpc(unsafe.Pointer(&buf)),
+			getcallerpc(),
 			funcPC(slicerunetostring))
 	}
 	if msanenabled && len(a) > 0 {

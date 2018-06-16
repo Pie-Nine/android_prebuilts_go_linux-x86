@@ -85,14 +85,14 @@ nocgo:
 	// start this M
 	BL	runtime·mstart(SB)
 
-	MOVD	R0, 1(R0)
+	MOVD	R0, 0(R0)
 	RET
 
 DATA	runtime·mainPC+0(SB)/8,$runtime·main(SB)
 GLOBL	runtime·mainPC(SB),RODATA,$8
 
 TEXT runtime·breakpoint(SB),NOSPLIT|NOFRAME,$0-0
-	MOVD	R0, 2(R0) // TODO: TD
+	MOVD	R0, 0(R0) // TODO: TD
 	RET
 
 TEXT runtime·asminit(SB),NOSPLIT|NOFRAME,$0-0
@@ -133,18 +133,6 @@ TEXT runtime·gosave(SB), NOSPLIT|NOFRAME, $0-8
 // restore state from Gobuf; longjmp
 TEXT runtime·gogo(SB), NOSPLIT, $16-8
 	MOVD	buf+0(FP), R5
-
-	// If ctxt is not nil, invoke deletion barrier before overwriting.
-	MOVD	gobuf_ctxt(R5), R3
-	CMP	R0, R3
-	BEQ	nilctxt
-	MOVD	$gobuf_ctxt(R5), R3
-	MOVD	R3, FIXED_FRAME+0(R1)
-	MOVD	R0, FIXED_FRAME+8(R1)
-	BL	runtime·writebarrierptr_prewrite(SB)
-	MOVD	buf+0(FP), R5
-
-nilctxt:
 	MOVD	gobuf_g(R5), g	// make sure g is not nil
 	BL	runtime·save_g(SB)
 
@@ -277,6 +265,9 @@ switch:
 
 noswitch:
 	// already on m stack, just call directly
+	// On other arches we do a tail call here, but it appears to be
+	// impossible to tail call a function pointer in shared mode on
+	// ppc64 because the caller is responsible for restoring the TOC.
 	MOVD	0(R11), R12	// code pointer
 	MOVD	R12, CTR
 	BL	(CTR)
@@ -317,7 +308,7 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD	LR, R8
 	MOVD	R8, (g_sched+gobuf_pc)(g)
 	MOVD	R5, (g_sched+gobuf_lr)(g)
-	// newstack will fill gobuf.ctxt.
+	MOVD	R11, (g_sched+gobuf_ctxt)(g)
 
 	// Called from f.
 	// Set m->morebuf to f's caller.
@@ -329,8 +320,7 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD	m_g0(R7), g
 	BL	runtime·save_g(SB)
 	MOVD	(g_sched+gobuf_sp)(g), R1
-	MOVDU   R0, -(FIXED_FRAME+8)(R1)	// create a call frame on g0
-	MOVD	R11, FIXED_FRAME+0(R1)	// ctxt argument
+	MOVDU   R0, -(FIXED_FRAME+0)(R1)	// create a call frame on g0
 	BL	runtime·newstack(SB)
 
 	// Not reached, but make sure the return PC from the call to newstack
@@ -340,24 +330,6 @@ TEXT runtime·morestack(SB),NOSPLIT|NOFRAME,$0-0
 TEXT runtime·morestack_noctxt(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD	R0, R11
 	BR	runtime·morestack(SB)
-
-TEXT runtime·stackBarrier(SB),NOSPLIT,$0
-	// We came here via a RET to an overwritten LR.
-	// R3 may be live. Other registers are available.
-
-	// Get the original return PC, g.stkbar[g.stkbarPos].savedLRVal.
-	MOVD	(g_stkbar+slice_array)(g), R4
-	MOVD	g_stkbarPos(g), R5
-	MOVD	$stkbar__size, R6
-	MULLD	R5, R6
-	ADD	R4, R6
-	MOVD	stkbar_savedLRVal(R6), R6
-	// Record that this stack barrier was hit.
-	ADD	$1, R5
-	MOVD	R5, g_stkbarPos(g)
-	// Jump to the original return PC.
-	MOVD	R6, CTR
-	BR	(CTR)
 
 // reflectcall: call a function with the given argument list
 // func call(argtype *_type, f *FuncVal, arg *byte, argsize, retoffset uint32).
@@ -732,30 +704,9 @@ TEXT setg_gcc<>(SB),NOSPLIT|NOFRAME,$0-0
 	MOVD	R4, LR
 	RET
 
-TEXT runtime·getcallerpc(SB),NOSPLIT,$8-16
-	MOVD	FIXED_FRAME+8(R1), R3		// LR saved by caller
-	MOVD	runtime·stackBarrierPC(SB), R4
-	CMP	R3, R4
-	BNE	nobar
-	// Get original return PC.
-	BL	runtime·nextBarrierPC(SB)
-	MOVD	FIXED_FRAME+0(R1), R3
-nobar:
-	MOVD	R3, ret+8(FP)
-	RET
-
-TEXT runtime·setcallerpc(SB),NOSPLIT,$8-16
-	MOVD	pc+8(FP), R3
-	MOVD	FIXED_FRAME+8(R1), R4
-	MOVD	runtime·stackBarrierPC(SB), R5
-	CMP	R4, R5
-	BEQ	setbar
-	MOVD	R3, FIXED_FRAME+8(R1)		// set LR in caller
-	RET
-setbar:
-	// Set the stack barrier return PC.
-	MOVD	R3, FIXED_FRAME+0(R1)
-	BL	runtime·setNextBarrierPC(SB)
+TEXT runtime·getcallerpc(SB),NOSPLIT|NOFRAME,$0-8
+	MOVD	0(R1), R3		// LR saved by caller
+	MOVD	R3, ret+0(FP)
 	RET
 
 TEXT runtime·abort(SB),NOSPLIT|NOFRAME,$0-0
@@ -775,23 +726,6 @@ TEXT runtime·cputicks(SB),NOSPLIT,$0-8
 	SLD	$32, R5
 	OR	R5, R3
 	MOVD	R3, ret+0(FP)
-	RET
-
-// memhash_varlen(p unsafe.Pointer, h seed) uintptr
-// redirects to memhash(p, h, size) using the size
-// stored in the closure.
-TEXT runtime·memhash_varlen(SB),NOSPLIT,$40-24
-	GO_ARGS
-	NO_LOCAL_POINTERS
-	MOVD	p+0(FP), R3
-	MOVD	h+8(FP), R4
-	MOVD	8(R11), R5
-	MOVD	R3, FIXED_FRAME+0(R1)
-	MOVD	R4, FIXED_FRAME+8(R1)
-	MOVD	R5, FIXED_FRAME+16(R1)
-	BL	runtime·memhash(SB)
-	MOVD	FIXED_FRAME+24(R1), R3
-	MOVD	R3, ret+16(FP)
 	RET
 
 // AES hashing not implemented for ppc64
@@ -1113,24 +1047,6 @@ equal:
 	MOVD    $1, R9
 	RET
 
-// eqstring tests whether two strings are equal.
-// The compiler guarantees that strings passed
-// to eqstring have equal length.
-// See runtime_test.go:eqstring_generic for
-// equivalent Go code.
-TEXT runtime·eqstring(SB),NOSPLIT,$0-33
-	MOVD    s1_base+0(FP), R3
-	MOVD    s2_base+16(FP), R4
-	MOVD    $1, R5
-	MOVB    R5, ret+32(FP)
-	CMP     R3, R4
-	BNE     2(PC)
-	RET
-	MOVD    s1_len+8(FP), R5
-	BL      runtime·memeqbody(SB)
-	MOVB    R9, ret+32(FP)
-	RET
-
 TEXT bytes·Equal(SB),NOSPLIT,$0-49
 	MOVD	a_len+8(FP), R4
 	MOVD	b_len+32(FP), R5
@@ -1152,87 +1068,367 @@ equal:
 	MOVBZ	R3,ret+48(FP)
 	RET
 
-TEXT bytes·IndexByte(SB),NOSPLIT,$0-40
-	MOVD	s+0(FP), R3
-	MOVD	s_len+8(FP), R4
-	MOVBZ	c+24(FP), R5	// byte to find
-	MOVD	R3, R6		// store base for later
-	SUB	$1, R3
-	ADD	R3, R4		// end-1
+TEXT bytes·IndexByte(SB),NOSPLIT|NOFRAME,$0-40
+	MOVD	s+0(FP), R3		// R3 = byte array pointer
+	MOVD	s_len+8(FP), R4		// R4 = length
+	MOVBZ	c+24(FP), R5		// R5 = byte
+	MOVD	$ret+32(FP), R14	// R14 = &ret
+	BR	runtime·indexbytebody<>(SB)
 
+TEXT strings·IndexByte(SB),NOSPLIT|NOFRAME,$0-32
+	MOVD	s+0(FP), R3	  // R3 = string
+	MOVD	s_len+8(FP), R4	  // R4 = length
+	MOVBZ	c+16(FP), R5	  // R5 = byte
+	MOVD	$ret+24(FP), R14  // R14 = &ret
+	BR	runtime·indexbytebody<>(SB)
+
+TEXT runtime·indexbytebody<>(SB),NOSPLIT|NOFRAME,$0-0
+	DCBT	(R3)		// Prepare cache line.
+	MOVD	R3,R17		// Save base address for calculating the index later.
+	RLDICR	$0,R3,$60,R8	// Align address to doubleword boundary in R8.
+	RLDIMI	$8,R5,$48,R5	// Replicating the byte across the register.
+	ADD	R4,R3,R7	// Last acceptable address in R7.
+
+	RLDIMI	$16,R5,$32,R5
+	CMPU	R4,$32		// Check if it's a small string (<32 bytes). Those will be processed differently.
+	MOVD	$-1,R9
+	WORD	$0x54661EB8	// Calculate padding in R6 (rlwinm r6,r3,3,26,28).
+	RLDIMI	$32,R5,$0,R5
+	MOVD	R7,R10		// Save last acceptable address in R10 for later.
+	ADD	$-1,R7,R7
+#ifdef GOARCH_ppc64le
+	SLD	R6,R9,R9	// Prepare mask for Little Endian
+#else
+	SRD	R6,R9,R9	// Same for Big Endian
+#endif
+	BLE	small_string	// Jump to the small string case if it's <32 bytes.
+
+	// If we are 64-byte aligned, branch to qw_align just to get the auxiliary values
+	// in V0, V1 and V10, then branch to the preloop.
+	ANDCC	$63,R3,R11
+	BEQ	CR0,qw_align
+	RLDICL	$0,R3,$61,R11
+
+	MOVD	0(R8),R12	// Load one doubleword from the aligned address in R8.
+	CMPB	R12,R5,R3	// Check for a match.
+	AND	R9,R3,R3	// Mask bytes below s_base
+	RLDICL	$0,R7,$61,R6	// length-1
+	RLDICR	$0,R7,$60,R7	// Last doubleword in R7
+	CMPU	R3,$0,CR7	// If we have a match, jump to the final computation
+	BNE	CR7,done
+	ADD	$8,R8,R8
+	ADD	$-8,R4,R4
+	ADD	R4,R11,R4
+
+	// Check for quadword alignment
+	ANDCC	$15,R8,R11
+	BEQ	CR0,qw_align
+
+	// Not aligned, so handle the next doubleword
+	MOVD	0(R8),R12
+	CMPB	R12,R5,R3
+	CMPU	R3,$0,CR7
+	BNE	CR7,done
+	ADD	$8,R8,R8
+	ADD	$-8,R4,R4
+
+	// Either quadword aligned or 64-byte at this point. We can use LVX.
+qw_align:
+
+	// Set up auxiliary data for the vectorized algorithm.
+	VSPLTISB  $0,V0		// Replicate 0 across V0
+	VSPLTISB  $3,V10	// Use V10 as control for VBPERMQ
+	MTVRD	  R5,V1
+	LVSL	  (R0+R0),V11
+	VSLB	  V11,V10,V10
+	VSPLTB	  $7,V1,V1	// Replicate byte across V1
+	CMPU	  R4, $64	// If len <= 64, don't use the vectorized loop
+	BLE	  tail
+
+	// We will load 4 quardwords per iteration in the loop, so check for
+	// 64-byte alignment. If 64-byte aligned, then branch to the preloop.
+	ANDCC	  $63,R8,R11
+	BEQ	  CR0,preloop
+
+	// Not 64-byte aligned. Load one quadword at a time until aligned.
+	LVX	    (R8+R0),V4
+	VCMPEQUBCC  V1,V4,V6		// Check for byte in V4
+	BNE	    CR6,found_qw_align
+	ADD	    $16,R8,R8
+	ADD	    $-16,R4,R4
+
+	ANDCC	    $63,R8,R11
+	BEQ	    CR0,preloop
+	LVX	    (R8+R0),V4
+	VCMPEQUBCC  V1,V4,V6		// Check for byte in V4
+	BNE	    CR6,found_qw_align
+	ADD	    $16,R8,R8
+	ADD	    $-16,R4,R4
+
+	ANDCC	    $63,R8,R11
+	BEQ	    CR0,preloop
+	LVX	    (R8+R0),V4
+	VCMPEQUBCC  V1,V4,V6		// Check for byte in V4
+	BNE	    CR6,found_qw_align
+	ADD	    $-16,R4,R4
+	ADD	    $16,R8,R8
+
+	// 64-byte aligned. Prepare for the main loop.
+preloop:
+	CMPU	R4,$64
+	BLE	tail	      // If len <= 64, don't use the vectorized loop
+
+	// We are now aligned to a 64-byte boundary. We will load 4 quadwords
+	// per loop iteration. The last doubleword is in R10, so our loop counter
+	// starts at (R10-R8)/64.
+	SUB	R8,R10,R6
+	SRD	$6,R6,R9      // Loop counter in R9
+	MOVD	R9,CTR
+
+	MOVD	$16,R11      // Load offsets for the vector loads
+	MOVD	$32,R9
+	MOVD	$48,R7
+
+	// Main loop we will load 64 bytes per iteration
 loop:
-	CMP	R3, R4
-	BEQ	notfound
-	MOVBZU	1(R3), R7
-	CMP	R7, R5
-	BNE	loop
+	LVX	    (R8+R0),V2	      // Load 4 16-byte vectors
+	LVX	    (R11+R8),V3
+	LVX	    (R9+R8),V4
+	LVX	    (R7+R8),V5
+	VCMPEQUB    V1,V2,V6	      // Look for byte in each vector
+	VCMPEQUB    V1,V3,V7
+	VCMPEQUB    V1,V4,V8
+	VCMPEQUB    V1,V5,V9
+	VOR	    V6,V7,V11	      // Compress the result in a single vector
+	VOR	    V8,V9,V12
+	VOR	    V11,V12,V11
+	VCMPEQUBCC  V0,V11,V11	      // Check for byte
+	BGE	    CR6,found
+	ADD	    $64,R8,R8
+	BC	    16,0,loop	      // bdnz loop
 
-	SUB	R6, R3		// remove base
-	MOVD	R3, ret+32(FP)
-	RET
+	// Handle the tailing bytes or R4 <= 64
+	RLDICL	$0,R6,$58,R4
+tail:
+	CMPU	    R4,$0
+	BEQ	    notfound
+	LVX	    (R8+R0),V4
+	VCMPEQUBCC  V1,V4,V6
+	BNE	    CR6,found_qw_align
+	ADD	    $16,R8,R8
+	CMPU	    R4,$16,CR6
+	BLE	    CR6,notfound
+	ADD	    $-16,R4,R4
+
+	LVX	    (R8+R0),V4
+	VCMPEQUBCC  V1,V4,V6
+	BNE	    CR6,found_qw_align
+	ADD	    $16,R8,R8
+	CMPU	    R4,$16,CR6
+	BLE	    CR6,notfound
+	ADD	    $-16,R4,R4
+
+	LVX	    (R8+R0),V4
+	VCMPEQUBCC  V1,V4,V6
+	BNE	    CR6,found_qw_align
+	ADD	    $16,R8,R8
+	CMPU	    R4,$16,CR6
+	BLE	    CR6,notfound
+	ADD	    $-16,R4,R4
+
+	LVX	    (R8+R0),V4
+	VCMPEQUBCC  V1,V4,V6
+	BNE	    CR6,found_qw_align
 
 notfound:
-	MOVD	$-1, R3
-	MOVD	R3, ret+32(FP)
+	MOVD	$-1,R3
+	MOVD	R3,(R14)
 	RET
 
-TEXT strings·IndexByte(SB),NOSPLIT,$0-32
-	MOVD	p+0(FP), R3
-	MOVD	b_len+8(FP), R4
-	MOVBZ	c+16(FP), R5	// byte to find
-	MOVD	R3, R6		// store base for later
-	SUB	$1, R3
-	ADD	R3, R4		// end-1
+found:
+	// We will now compress the results into a single doubleword,
+	// so it can be moved to a GPR for the final index calculation.
 
-loop:
-	CMP	R3, R4
+	// The bytes in V6-V9 are either 0x00 or 0xFF. So, permute the
+	// first bit of each byte into bits 48-63.
+	VBPERMQ	  V6,V10,V6
+	VBPERMQ	  V7,V10,V7
+	VBPERMQ	  V8,V10,V8
+	VBPERMQ	  V9,V10,V9
+
+	// Shift each 16-bit component into its correct position for
+	// merging into a single doubleword.
+#ifdef GOARCH_ppc64le
+	VSLDOI	  $2,V7,V7,V7
+	VSLDOI	  $4,V8,V8,V8
+	VSLDOI	  $6,V9,V9,V9
+#else
+	VSLDOI	  $6,V6,V6,V6
+	VSLDOI	  $4,V7,V7,V7
+	VSLDOI	  $2,V8,V8,V8
+#endif
+
+	// Merge V6-V9 into a single doubleword and move to a GPR.
+	VOR	V6,V7,V11
+	VOR	V8,V9,V4
+	VOR	V4,V11,V4
+	MFVRD	V4,R3
+
+#ifdef GOARCH_ppc64le
+	ADD	  $-1,R3,R11
+	ANDN	  R3,R11,R11
+	POPCNTD	  R11,R11	// Count trailing zeros (Little Endian).
+#else
+	CNTLZD	R3,R11		// Count leading zeros (Big Endian).
+#endif
+	ADD	R8,R11,R3	// Calculate byte address
+
+return:
+	SUB	R17,R3
+	MOVD	R3,(R14)
+	RET
+
+found_qw_align:
+	// Use the same algorithm as above. Compress the result into
+	// a single doubleword and move it to a GPR for the final
+	// calculation.
+	VBPERMQ	  V6,V10,V6
+
+#ifdef GOARCH_ppc64le
+	MFVRD	  V6,R3
+	ADD	  $-1,R3,R11
+	ANDN	  R3,R11,R11
+	POPCNTD	  R11,R11
+#else
+	VSLDOI	  $6,V6,V6,V6
+	MFVRD	  V6,R3
+	CNTLZD	  R3,R11
+#endif
+	ADD	  R8,R11,R3
+	CMPU	  R11,R4
+	BLT	  return
+	BR	  notfound
+
+done:
+	// At this point, R3 has 0xFF in the same position as the byte we are
+	// looking for in the doubleword. Use that to calculate the exact index
+	// of the byte.
+#ifdef GOARCH_ppc64le
+	ADD	$-1,R3,R11
+	ANDN	R3,R11,R11
+	POPCNTD	R11,R11		// Count trailing zeros (Little Endian).
+#else
+	CNTLZD	R3,R11		// Count leading zeros (Big Endian).
+#endif
+	CMPU	R8,R7		// Check if we are at the last doubleword.
+	SRD	$3,R11		// Convert trailing zeros to bytes.
+	ADD	R11,R8,R3
+	CMPU	R11,R6,CR7	// If at the last doubleword, check the byte offset.
+	BNE	return
+	BLE	CR7,return
+	BR	notfound
+
+small_string:
+	// We unroll this loop for better performance.
+	CMPU	R4,$0		// Check for length=0
 	BEQ	notfound
-	MOVBZU	1(R3), R7
-	CMP	R7, R5
-	BNE	loop
 
-	SUB	R6, R3		// remove base
-	MOVD	R3, ret+24(FP)
-	RET
+	MOVD	0(R8),R12	// Load one doubleword from the aligned address in R8.
+	CMPB	R12,R5,R3	// Check for a match.
+	AND	R9,R3,R3	// Mask bytes below s_base.
+	CMPU	R3,$0,CR7	// If we have a match, jump to the final computation.
+	RLDICL	$0,R7,$61,R6	// length-1
+	RLDICR	$0,R7,$60,R7	// Last doubleword in R7.
+	CMPU	R8,R7
+	BNE	CR7,done
+	BEQ	notfound	// Hit length.
 
-notfound:
-	MOVD	$-1, R3
-	MOVD	R3, ret+24(FP)
-	RET
+	MOVDU	8(R8),R12
+	CMPB	R12,R5,R3
+	CMPU	R3,$0,CR6
+	CMPU	R8,R7
+	BNE	CR6,done
+	BEQ	notfound
+
+	MOVDU	8(R8),R12
+	CMPB	R12,R5,R3
+	CMPU	R3,$0,CR6
+	CMPU	R8,R7
+	BNE	CR6,done
+	BEQ	notfound
+
+	MOVDU	8(R8),R12
+	CMPB	R12,R5,R3
+	CMPU	R3,$0,CR6
+	CMPU	R8,R7
+	BNE	CR6,done
+	BEQ	notfound
+
+	MOVDU	8(R8),R12
+	CMPB	R12,R5,R3
+	CMPU	R3,$0,CR6
+	BNE	CR6,done
+	BR	notfound
 
 TEXT runtime·cmpstring(SB),NOSPLIT|NOFRAME,$0-40
 	MOVD	s1_base+0(FP), R5
-	MOVD	s1_len+8(FP), R3
 	MOVD	s2_base+16(FP), R6
+	MOVD	s1_len+8(FP), R3
+	CMP	R5,R6,CR7
 	MOVD	s2_len+24(FP), R4
 	MOVD	$ret+32(FP), R7
+	CMP	R3,R4,CR6
+	BEQ	CR7,equal
+
+notequal:
 #ifdef	GOARCH_ppc64le
 	BR	cmpbodyLE<>(SB)
 #else
 	BR      cmpbodyBE<>(SB)
 #endif
+
+equal:
+	BEQ	CR6,done
+	MOVD	$1, R8
+	BGT	CR6,greater
+	NEG	R8
+
+greater:
+	MOVD	R8, (R7)
+	RET
+
+done:
+	MOVD	$0, (R7)
+	RET
 
 TEXT bytes·Compare(SB),NOSPLIT|NOFRAME,$0-56
 	MOVD	s1+0(FP), R5
-	MOVD	s1+8(FP), R3
 	MOVD	s2+24(FP), R6
+	MOVD	s1+8(FP), R3
+	CMP	R5,R6,CR7
 	MOVD	s2+32(FP), R4
 	MOVD	$ret+48(FP), R7
+	CMP	R3,R4,CR6
+	BEQ	CR7,equal
+
 #ifdef	GOARCH_ppc64le
 	BR	cmpbodyLE<>(SB)
 #else
 	BR      cmpbodyBE<>(SB)
 #endif
 
-TEXT runtime·fastrand(SB), NOSPLIT, $0-4
-	MOVD	g_m(g), R4
-	MOVWZ	m_fastrand(R4), R3
-	ADD	R3, R3
-	CMPW	R3, $0
-	BGE	2(PC)
-	XOR	$0x88888eef, R3
-	MOVW	R3, m_fastrand(R4)
-	MOVW	R3, ret+0(FP)
+equal:
+	BEQ	CR6,done
+	MOVD	$1, R8
+	BGT	CR6,greater
+	NEG	R8
+
+greater:
+	MOVD	R8, (R7)
+	RET
+
+done:
+	MOVD	$0, (R7)
 	RET
 
 TEXT runtime·return0(SB), NOSPLIT, $0
@@ -1272,18 +1468,6 @@ TEXT runtime·goexit(SB),NOSPLIT|NOFRAME,$0-0
 	BL	runtime·goexit1(SB)	// does not return
 	// traceback from goexit1 must hit code range of goexit
 	MOVD	R0, R0	// NOP
-
-TEXT runtime·prefetcht0(SB),NOSPLIT,$0-8
-	RET
-
-TEXT runtime·prefetcht1(SB),NOSPLIT,$0-8
-	RET
-
-TEXT runtime·prefetcht2(SB),NOSPLIT,$0-8
-	RET
-
-TEXT runtime·prefetchnta(SB),NOSPLIT,$0-8
-	RET
 
 TEXT runtime·sigreturn(SB),NOSPLIT,$0-0
 	RET

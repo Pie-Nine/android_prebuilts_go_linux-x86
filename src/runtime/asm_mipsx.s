@@ -109,17 +109,6 @@ TEXT runtime·gosave(SB),NOSPLIT,$-4-4
 // restore state from Gobuf; longjmp
 TEXT runtime·gogo(SB),NOSPLIT,$8-4
 	MOVW	buf+0(FP), R3
-
-	// If ctxt is not nil, invoke deletion barrier before overwriting.
-	MOVW	gobuf_ctxt(R3), R1
-	BEQ	R1, nilctxt
-	MOVW	$gobuf_ctxt(R3), R1
-	MOVW	R1, 4(R29)
-	MOVW	R0, 8(R29)
-	JAL	runtime·writebarrierptr_prewrite(SB)
-	MOVW	buf+0(FP), R3
-
-nilctxt:
 	MOVW	gobuf_g(R3), g	// make sure g is not nil
 	JAL	runtime·save_g(SB)
 
@@ -226,9 +215,12 @@ switch:
 
 noswitch:
 	// already on m stack, just call directly
+	// Using a tail call here cleans up tracebacks since we won't stop
+	// at an intermediate systemstack.
 	MOVW	0(REGCTXT), R4	// code pointer
-	JAL	(R4)
-	RET
+	MOVW	0(R29), R31	// restore LR
+	ADD	$4, R29
+	JMP	(R4)
 
 /*
  * support for morestack
@@ -261,7 +253,7 @@ TEXT runtime·morestack(SB),NOSPLIT,$-4-0
 	MOVW	R29, (g_sched+gobuf_sp)(g)
 	MOVW	R31, (g_sched+gobuf_pc)(g)
 	MOVW	R3, (g_sched+gobuf_lr)(g)
-	// newstack will fill gobuf.ctxt.
+	MOVW	REGCTXT, (g_sched+gobuf_ctxt)(g)
 
 	// Called from f.
 	// Set m->morebuf to f's caller.
@@ -274,9 +266,8 @@ TEXT runtime·morestack(SB),NOSPLIT,$-4-0
 	JAL	runtime·save_g(SB)
 	MOVW	(g_sched+gobuf_sp)(g), R29
 	// Create a stack frame on g0 to call newstack.
-	MOVW	R0, -8(R29)	// Zero saved LR in frame
-	ADDU	$-8, R29
-	MOVW	REGCTXT, 4(R29)	// ctxt argument
+	MOVW	R0, -4(R29)	// Zero saved LR in frame
+	ADDU	$-4, R29
 	JAL	runtime·newstack(SB)
 
 	// Not reached, but make sure the return PC from the call to newstack
@@ -286,22 +277,6 @@ TEXT runtime·morestack(SB),NOSPLIT,$-4-0
 TEXT runtime·morestack_noctxt(SB),NOSPLIT,$0-0
 	MOVW	R0, REGCTXT
 	JMP	runtime·morestack(SB)
-
-TEXT runtime·stackBarrier(SB),NOSPLIT,$0
-	// We came here via a RET to an overwritten LR.
-	// R1 may be live. Other registers are available.
-
-	// Get the original return PC, g.stkbar[g.stkbarPos].savedLRVal.
-	MOVW	(g_stkbar+slice_array)(g), R2
-	MOVW	g_stkbarPos(g), R3
-	MOVW	$stkbar__size, R4
-	MULU	R3, R4
-	MOVW	LO, R4
-	ADDU	R2, R4
-	MOVW	stkbar_savedLRVal(R4), R4
-	ADDU	$1, R3
-	MOVW	R3, g_stkbarPos(g)	// Record that this stack barrier was hit.
-	JMP	(R4)	// Jump to the original return PC.
 
 // reflectcall: call a function with the given argument list
 // func call(argtype *_type, f *FuncVal, arg *byte, argsize, retoffset uint32).
@@ -635,47 +610,13 @@ TEXT setg_gcc<>(SB),NOSPLIT,$0
 	JAL	runtime·save_g(SB)
 	RET
 
-TEXT runtime·getcallerpc(SB),NOSPLIT,$4-8
-	MOVW	8(R29), R1	// LR saved by caller
-	MOVW	runtime·stackBarrierPC(SB), R2
-	BNE	R1, R2, nobar
-	JAL	runtime·nextBarrierPC(SB)	// Get original return PC.
-	MOVW	4(R29), R1
-nobar:
-	MOVW	R1, ret+4(FP)
-	RET
-
-TEXT runtime·setcallerpc(SB),NOSPLIT,$4-8
-	MOVW	pc+4(FP), R1
-	MOVW	8(R29), R2
-	MOVW	runtime·stackBarrierPC(SB), R3
-	BEQ	R2, R3, setbar
-	MOVW	R1, 8(R29)	// set LR in caller
-	RET
-setbar:
-	MOVW	R1, 4(R29)
-	JAL	runtime·setNextBarrierPC(SB)	// Set the stack barrier return PC.
+TEXT runtime·getcallerpc(SB),NOSPLIT,$-4-4
+	MOVW	0(R29), R1	// LR saved by caller
+	MOVW	R1, ret+0(FP)
 	RET
 
 TEXT runtime·abort(SB),NOSPLIT,$0-0
 	UNDEF
-
-// memhash_varlen(p unsafe.Pointer, h seed) uintptr
-// redirects to memhash(p, h, size) using the size
-// stored in the closure.
-TEXT runtime·memhash_varlen(SB),NOSPLIT,$16-12
-	GO_ARGS
-	NO_LOCAL_POINTERS
-	MOVW	p+0(FP), R1
-	MOVW	h+4(FP), R2
-	MOVW	4(REGCTXT), R3
-	MOVW	R1, 4(R29)
-	MOVW	R2, 8(R29)
-	MOVW	R3, 12(R29)
-	JAL	runtime·memhash(SB)
-	MOVW	16(R29), R1
-	MOVW	R1, ret+8(FP)
-	RET
 
 // Not implemented.
 TEXT runtime·aeshash(SB),NOSPLIT,$0
@@ -743,31 +684,6 @@ test:
 eq:
 	MOVW	$1, R1
 	MOVB	R1, ret+8(FP)
-	RET
-
-// eqstring tests whether two strings are equal.
-// The compiler guarantees that strings passed
-// to eqstring have equal length.
-// See runtime_test.go:eqstring_generic for
-// equivalent Go code.
-TEXT runtime·eqstring(SB),NOSPLIT,$0-17
-	MOVW	s1_base+0(FP), R1
-	MOVW	s2_base+8(FP), R2
-	MOVW	$1, R3
-	MOVBU	R3, ret+16(FP)
-	BNE	R1, R2, 2(PC)
-	RET
-	MOVW	s1_len+4(FP), R3
-	ADDU	R1, R3, R4
-loop:
-	BNE	R1, R4, 2(PC)
-	RET
-	MOVBU	(R1), R6
-	ADDU	$1, R1
-	MOVBU	(R2), R7
-	ADDU	$1, R2
-	BEQ	R6, R7, loop
-	MOVB	R0, ret+16(FP)
 	RET
 
 TEXT bytes·Equal(SB),NOSPLIT,$0-25
@@ -904,16 +820,6 @@ cmp_ret:
 	MOVW	R8, ret+24(FP)
 	RET
 
-TEXT runtime·fastrand(SB),NOSPLIT,$0-4
-	MOVW	g_m(g), R2
-	MOVW	m_fastrand(R2), R1
-	ADDU	R1, R1
-	BGEZ	R1, 2(PC)
-	XOR	$0x88888eef, R1
-	MOVW	R1, m_fastrand(R2)
-	MOVW	R1, ret+0(FP)
-	RET
-
 TEXT runtime·return0(SB),NOSPLIT,$0
 	MOVW	$0, R1
 	RET
@@ -945,18 +851,6 @@ TEXT runtime·goexit(SB),NOSPLIT,$-4-0
 	JAL	runtime·goexit1(SB)	// does not return
 	// traceback from goexit1 must hit code range of goexit
 	NOR	R0, R0	// NOP
-
-TEXT runtime·prefetcht0(SB),NOSPLIT,$0-4
-	RET
-
-TEXT runtime·prefetcht1(SB),NOSPLIT,$0-4
-	RET
-
-TEXT runtime·prefetcht2(SB),NOSPLIT,$0-4
-	RET
-
-TEXT runtime·prefetchnta(SB),NOSPLIT,$0-4
-	RET
 
 TEXT ·checkASM(SB),NOSPLIT,$0-1
 	MOVW	$1, R1
