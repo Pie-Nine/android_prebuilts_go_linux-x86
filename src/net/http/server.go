@@ -2,7 +2,7 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-// HTTP server. See RFC 2616.
+// HTTP server. See RFC 7230 through 7235.
 
 package http
 
@@ -28,7 +28,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang_org/x/net/lex/httplex"
+	"golang_org/x/net/http/httpguts"
 )
 
 // Errors used by the HTTP server.
@@ -107,7 +107,7 @@ type ResponseWriter interface {
 	// is to prefix the Header map keys with the TrailerPrefix
 	// constant value. See TrailerPrefix.
 	//
-	// To suppress implicit response headers (such as "Date"), set
+	// To suppress automatic response headers (such as "Date"), set
 	// their value to nil.
 	Header() Header
 
@@ -117,7 +117,9 @@ type ResponseWriter interface {
 	// WriteHeader(http.StatusOK) before writing the data. If the Header
 	// does not contain a Content-Type line, Write adds a Content-Type set
 	// to the result of passing the initial 512 bytes of written data to
-	// DetectContentType.
+	// DetectContentType. Additionally, if the total size of all written
+	// data is under a few KB and there are no Flush calls, the
+	// Content-Length header is added automatically.
 	//
 	// Depending on the HTTP protocol version and the client, calling
 	// Write or WriteHeader may prevent future reads on the
@@ -187,8 +189,10 @@ type Hijacker interface {
 	// The returned bufio.Reader may contain unprocessed buffered
 	// data from the client.
 	//
-	// After a call to Hijack, the original Request.Body must
-	// not be used.
+	// After a call to Hijack, the original Request.Body must not
+	// be used. The original Request's Context remains valid and
+	// is not canceled until the Request's ServeHTTP method
+	// returns.
 	Hijack() (net.Conn, *bufio.ReadWriter, error)
 }
 
@@ -227,8 +231,8 @@ var (
 	ServerContextKey = &contextKey{"http-server"}
 
 	// LocalAddrContextKey is a context key. It can be used in
-	// HTTP handlers with context.WithValue to access the address
-	// the local address the connection arrived on.
+	// HTTP handlers with context.WithValue to access the local
+	// address the connection arrived on.
 	// The associated value will be of type net.Addr.
 	LocalAddrContextKey = &contextKey{"local-addr"}
 )
@@ -510,9 +514,8 @@ func (b *atomicBool) setTrue()    { atomic.StoreInt32((*int32)(b), 1) }
 // written in the trailers at the end of the response.
 func (w *response) declareTrailer(k string) {
 	k = CanonicalHeaderKey(k)
-	switch k {
-	case "Transfer-Encoding", "Content-Length", "Trailer":
-		// Forbidden by RFC 2616 14.40.
+	if !httpguts.ValidTrailerHeader(k) {
+		// Forbidden by RFC 7230, section 4.1.2
 		return
 	}
 	w.trailers = append(w.trailers, k)
@@ -937,7 +940,7 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 
 	c.r.setReadLimit(c.server.initialReadLimitSize())
 	if c.lastMethod == "POST" {
-		// RFC 2616 section 4.1 tolerance for old buggy clients.
+		// RFC 7230 section 3 tolerance for old buggy clients.
 		peek, _ := c.bufr.Peek(4) // ReadRequest will get err below
 		c.bufr.Discard(numLeadingCRorLF(peek))
 	}
@@ -964,15 +967,15 @@ func (c *conn) readRequest(ctx context.Context) (w *response, err error) {
 	if len(hosts) > 1 {
 		return nil, badRequestError("too many Host headers")
 	}
-	if len(hosts) == 1 && !httplex.ValidHostHeader(hosts[0]) {
+	if len(hosts) == 1 && !httpguts.ValidHostHeader(hosts[0]) {
 		return nil, badRequestError("malformed Host header")
 	}
 	for k, vv := range req.Header {
-		if !httplex.ValidHeaderFieldName(k) {
+		if !httpguts.ValidHeaderFieldName(k) {
 			return nil, badRequestError("invalid header name")
 		}
 		for _, v := range vv {
-			if !httplex.ValidHeaderFieldValue(v) {
+			if !httpguts.ValidHeaderFieldValue(v) {
 				return nil, badRequestError("invalid header value")
 			}
 		}
@@ -1058,7 +1061,7 @@ func checkWriteHeaderCode(code int) {
 	// Issue 22880: require valid WriteHeader status codes.
 	// For now we only enforce that it's three digits.
 	// In the future we might block things over 599 (600 and above aren't defined
-	// at http://httpwg.org/specs/rfc7231.html#status.codes)
+	// at https://httpwg.org/specs/rfc7231.html#status.codes)
 	// and we might block under 200 (once we have more mature 1xx support).
 	// But for now any three digits.
 	//
@@ -1338,7 +1341,15 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 		// If no content type, apply sniffing algorithm to body.
 		_, haveType := header["Content-Type"]
 		if !haveType && !hasTE && len(p) > 0 {
-			setHeader.contentType = DetectContentType(p)
+			if cto := header.get("X-Content-Type-Options"); strings.EqualFold("nosniff", cto) {
+				// nosniff is an explicit directive not to guess a content-type.
+				// Content-sniffing is no less susceptible to polyglot attacks via
+				// hosted content when done on the server.
+				setHeader.contentType = "application/octet-stream"
+				w.conn.server.logf("http: WriteHeader called with X-Content-Type-Options:nosniff but no Content-Type")
+			} else {
+				setHeader.contentType = DetectContentType(p)
+			}
 		}
 	} else {
 		for _, k := range suppressedHeaders(code) {
@@ -1414,7 +1425,7 @@ func (cw *chunkWriter) writeHeader(p []byte) {
 }
 
 // foreachHeaderElement splits v according to the "#rule" construction
-// in RFC 2616 section 2.1 and calls fn for each non-empty element.
+// in RFC 7230 section 7 and calls fn for each non-empty element.
 func foreachHeaderElement(v string, fn func(string)) {
 	v = textproto.TrimString(v)
 	if v == "" {
@@ -1431,7 +1442,7 @@ func foreachHeaderElement(v string, fn func(string)) {
 	}
 }
 
-// writeStatusLine writes an HTTP/1.x Status-Line (RFC 2616 Section 6.1)
+// writeStatusLine writes an HTTP/1.x Status-Line (RFC 7230 Section 3.1.2)
 // to bw. is11 is whether the HTTP request is HTTP/1.1. false means HTTP/1.0.
 // code is the response status code.
 // scratch is an optional scratch buffer. If it has at least capacity 3, it's used.
@@ -1868,11 +1879,11 @@ func (w *response) sendExpectationFailed() {
 	// make the ResponseWriter an optional
 	// "ExpectReplier" interface or something.
 	//
-	// For now we'll just obey RFC 2616 14.20 which says
-	// "If a server receives a request containing an
-	// Expect field that includes an expectation-
-	// extension that it does not support, it MUST
-	// respond with a 417 (Expectation Failed) status."
+	// For now we'll just obey RFC 7231 5.1.1 which says
+	// "A server that receives an Expect field-value other
+	// than 100-continue MAY respond with a 417 (Expectation
+	// Failed) status code to indicate that the unexpected
+	// expectation cannot be met."
 	w.Header().Set("Connection", "close")
 	w.WriteHeader(StatusExpectationFailed)
 	w.finishRequest()
@@ -1995,25 +2006,19 @@ func StripPrefix(prefix string, h Handler) Handler {
 //
 // The provided code should be in the 3xx range and is usually
 // StatusMovedPermanently, StatusFound or StatusSeeOther.
+//
+// If the Content-Type header has not been set, Redirect sets it
+// to "text/html; charset=utf-8" and writes a small HTML body.
+// Setting the Content-Type header to any value, including nil,
+// disables that behavior.
 func Redirect(w ResponseWriter, r *Request, url string, code int) {
 	// parseURL is just url.Parse (url is shadowed for godoc).
 	if u, err := parseURL(url); err == nil {
-		// If url was relative, make absolute by
+		// If url was relative, make its path absolute by
 		// combining with request path.
-		// The browser would probably do this for us,
+		// The client would probably do this for us,
 		// but doing it ourselves is more reliable.
-
-		// NOTE(rsc): RFC 2616 says that the Location
-		// line must be an absolute URI, like
-		// "http://www.google.com/redirect/",
-		// not a path like "/redirect/".
-		// Unfortunately, we don't know what to
-		// put in the host name section to get the
-		// client to connect to us again, so we can't
-		// know the right absolute URI to send back.
-		// Because of this problem, no one pays attention
-		// to the RFC; they all send back just a new path.
-		// So do we.
+		// See RFC 7231, section 7.1.2
 		if u.Scheme == "" && u.Host == "" {
 			oldpath := r.URL.Path
 			if oldpath == "" { // should not happen, but avoid a crash if it does
@@ -2042,18 +2047,23 @@ func Redirect(w ResponseWriter, r *Request, url string, code int) {
 		}
 	}
 
-	w.Header().Set("Location", hexEscapeNonASCII(url))
-	if r.Method == "GET" || r.Method == "HEAD" {
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	h := w.Header()
+
+	// RFC 7231 notes that a short HTML body is usually included in
+	// the response because older user agents may not understand 301/307.
+	// Do it only if the request didn't already have a Content-Type header.
+	_, hadCT := h["Content-Type"]
+
+	h.Set("Location", hexEscapeNonASCII(url))
+	if !hadCT && (r.Method == "GET" || r.Method == "HEAD") {
+		h.Set("Content-Type", "text/html; charset=utf-8")
 	}
 	w.WriteHeader(code)
 
-	// RFC 2616 recommends that a short note "SHOULD" be included in the
-	// response because older user agents may not understand 301/307.
-	// Shouldn't send the response for POST or HEAD; that leaves GET.
-	if r.Method == "GET" {
-		note := "<a href=\"" + htmlEscape(url) + "\">" + statusText[code] + "</a>.\n"
-		fmt.Fprintln(w, note)
+	// Shouldn't send the body for POST or HEAD; that leaves GET.
+	if !hadCT && r.Method == "GET" {
+		body := "<a href=\"" + htmlEscape(url) + "\">" + statusText[code] + "</a>.\n"
+		fmt.Fprintln(w, body)
 	}
 }
 
@@ -2127,9 +2137,9 @@ func RedirectHandler(url string, code int) Handler {
 // "/codesearch" and "codesearch.google.com/" without also taking over
 // requests for "http://www.google.com/".
 //
-// ServeMux also takes care of sanitizing the URL request path,
-// redirecting any request containing . or .. elements or repeated slashes
-// to an equivalent, cleaner URL.
+// ServeMux also takes care of sanitizing the URL request path and the Host
+// header, stripping the port number and redirecting any request containing . or
+// .. elements or repeated slashes to an equivalent, cleaner URL.
 type ServeMux struct {
 	mu    sync.RWMutex
 	m     map[string]muxEntry
@@ -2162,7 +2172,7 @@ func pathMatch(pattern, path string) bool {
 	return len(path) >= n && path[0:n] == pattern
 }
 
-// Return the canonical path for p, eliminating . and .. elements.
+// cleanPath returns the canonical path for p, eliminating . and .. elements.
 func cleanPath(p string) string {
 	if p == "" {
 		return "/"
@@ -2174,7 +2184,12 @@ func cleanPath(p string) string {
 	// path.Clean removes trailing slash except for root;
 	// put the trailing slash back if necessary.
 	if p[len(p)-1] == '/' && np != "/" {
-		np += "/"
+		// Fast path for common case of p being the string we want:
+		if len(p) == len(np)+1 && strings.HasPrefix(p, np) {
+			np = p
+		} else {
+			np += "/"
+		}
 	}
 	return np
 }
@@ -2221,7 +2236,10 @@ func (mux *ServeMux) match(path string) (h Handler, pattern string) {
 // not for path itself. If the path needs appending to, it creates a new
 // URL, setting the path to u.Path + "/" and returning true to indicate so.
 func (mux *ServeMux) redirectToPathSlash(host, path string, u *url.URL) (*url.URL, bool) {
-	if !mux.shouldRedirect(host, path) {
+	mux.mu.RLock()
+	shouldRedirect := mux.shouldRedirectRLocked(host, path)
+	mux.mu.RUnlock()
+	if !shouldRedirect {
 		return u, false
 	}
 	path = path + "/"
@@ -2229,10 +2247,10 @@ func (mux *ServeMux) redirectToPathSlash(host, path string, u *url.URL) (*url.UR
 	return u, true
 }
 
-// shouldRedirect reports whether the given path and host should be redirected to
+// shouldRedirectRLocked reports whether the given path and host should be redirected to
 // path+"/". This should happen if a handler is registered for path+"/" but
 // not path -- see comments at ServeMux.
-func (mux *ServeMux) shouldRedirect(host, path string) bool {
+func (mux *ServeMux) shouldRedirectRLocked(host, path string) bool {
 	p := []string{path, host + path}
 
 	for _, c := range p {
@@ -2365,6 +2383,9 @@ func (mux *ServeMux) Handle(pattern string, handler Handler) {
 
 // HandleFunc registers the handler function for the given pattern.
 func (mux *ServeMux) HandleFunc(pattern string, handler func(ResponseWriter, *Request)) {
+	if handler == nil {
+		panic("http: nil handler")
+	}
 	mux.Handle(pattern, HandlerFunc(handler))
 }
 
@@ -2481,7 +2502,7 @@ type Server struct {
 	nextProtoErr      error     // result of http2.ConfigureServer if used
 
 	mu         sync.Mutex
-	listeners  map[net.Listener]struct{}
+	listeners  map[*net.Listener]struct{}
 	activeConn map[*conn]struct{}
 	doneChan   chan struct{}
 	onShutdown []func()
@@ -2617,7 +2638,7 @@ func (s *Server) closeIdleConns() bool {
 func (s *Server) closeListenersLocked() error {
 	var err error
 	for ln := range s.listeners {
-		if cerr := ln.Close(); cerr != nil && err == nil {
+		if cerr := (*ln).Close(); cerr != nil && err == nil {
 			err = cerr
 		}
 		delete(s.listeners, ln)
@@ -2751,18 +2772,21 @@ var ErrServerClosed = errors.New("http: Server closed")
 // Serve always returns a non-nil error. After Shutdown or Close, the
 // returned error is ErrServerClosed.
 func (srv *Server) Serve(l net.Listener) error {
-	defer l.Close()
 	if fn := testHookServerServe; fn != nil {
-		fn(srv, l)
+		fn(srv, l) // call hook with unwrapped listener
 	}
+
+	l = &onceCloseListener{Listener: l}
+	defer l.Close()
+
 	var tempDelay time.Duration // how long to sleep on accept failure
 
 	if err := srv.setupHTTP2_Serve(); err != nil {
 		return err
 	}
 
-	srv.trackListener(l, true)
-	defer srv.trackListener(l, false)
+	srv.trackListener(&l, true)
+	defer srv.trackListener(&l, false)
 
 	baseCtx := context.Background() // base is always background, per Issue 16220
 	ctx := context.WithValue(baseCtx, ServerContextKey, srv)
@@ -2839,11 +2863,19 @@ func (srv *Server) ServeTLS(l net.Listener, certFile, keyFile string) error {
 	return srv.Serve(tlsListener)
 }
 
-func (s *Server) trackListener(ln net.Listener, add bool) {
+// trackListener adds or removes a net.Listener to the set of tracked
+// listeners.
+//
+// We store a pointer to interface in the map set, in case the
+// net.Listener is not comparable. This is safe because we only call
+// trackListener via Serve and can track+defer untrack the same
+// pointer to local variable there. We never need to compare a
+// Listener from another caller.
+func (s *Server) trackListener(ln *net.Listener, add bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.listeners == nil {
-		s.listeners = make(map[net.Listener]struct{})
+		s.listeners = make(map[*net.Listener]struct{})
 	}
 	if add {
 		// If the *Server is being reused after a previous
@@ -3221,6 +3253,21 @@ func (ln tcpKeepAliveListener) Accept() (net.Conn, error) {
 	tc.SetKeepAlivePeriod(3 * time.Minute)
 	return tc, nil
 }
+
+// onceCloseListener wraps a net.Listener, protecting it from
+// multiple Close calls.
+type onceCloseListener struct {
+	net.Listener
+	once     sync.Once
+	closeErr error
+}
+
+func (oc *onceCloseListener) Close() error {
+	oc.once.Do(oc.close)
+	return oc.closeErr
+}
+
+func (oc *onceCloseListener) close() { oc.closeErr = oc.Listener.Close() }
 
 // globalOptionsHandler responds to "OPTIONS *" requests.
 type globalOptionsHandler struct{}

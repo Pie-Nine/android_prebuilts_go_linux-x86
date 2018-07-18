@@ -46,6 +46,11 @@ func isgoexception(info *exceptionrecord, r *context) bool {
 		return false
 	}
 
+	if isAbortPC(r.ip()) {
+		// Never turn abort into a panic.
+		return false
+	}
+
 	// Go will only handle some exceptions.
 	switch info.exceptioncode {
 	default:
@@ -219,6 +224,7 @@ func signame(sig uint32) string {
 	return ""
 }
 
+//go:nosplit
 func crash() {
 	// TODO: This routine should do whatever is needed
 	// to make the Windows program abort/crash as it

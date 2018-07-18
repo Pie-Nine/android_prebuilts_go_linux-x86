@@ -13,6 +13,8 @@ package syscall
 
 import "unsafe"
 
+func rawSyscallNoError(trap, a1, a2, a3 uintptr) (r1, r2 uintptr)
+
 /*
  * Wrapped
  */
@@ -31,6 +33,31 @@ func Chown(path string, uid int, gid int) (err error) {
 
 func Creat(path string, mode uint32) (fd int, err error) {
 	return Open(path, O_CREAT|O_WRONLY|O_TRUNC, mode)
+}
+
+//sys	faccessat(dirfd int, path string, mode uint32) (err error)
+
+func Faccessat(dirfd int, path string, mode uint32, flags int) (err error) {
+	if flags & ^(_AT_SYMLINK_NOFOLLOW|_AT_EACCESS) != 0 {
+		return EINVAL
+	} else if flags&(_AT_SYMLINK_NOFOLLOW|_AT_EACCESS) != 0 {
+		return EOPNOTSUPP
+	}
+	return faccessat(dirfd, path, mode)
+}
+
+//sys	fchmodat(dirfd int, path string, mode uint32) (err error)
+
+func Fchmodat(dirfd int, path string, mode uint32, flags int) (err error) {
+	// Linux fchmodat doesn't support the flags parameter. Mimick glibc's behavior
+	// and check the flags. Otherwise the mode would be applied to the symlink
+	// destination which is not what the user expects.
+	if flags&^_AT_SYMLINK_NOFOLLOW != 0 {
+		return EINVAL
+	} else if flags&_AT_SYMLINK_NOFOLLOW != 0 {
+		return EOPNOTSUPP
+	}
+	return fchmodat(dirfd, path, mode)
 }
 
 //sys	linkat(olddirfd int, oldpath string, newdirfd int, newpath string, flags int) (err error)
@@ -539,15 +566,17 @@ func Recvmsg(fd int, p, oob []byte, flags int) (n, oobn int, recvflags int, from
 	}
 	var dummy byte
 	if len(oob) > 0 {
-		var sockType int
-		sockType, err = GetsockoptInt(fd, SOL_SOCKET, SO_TYPE)
-		if err != nil {
-			return
-		}
-		// receive at least one normal byte
-		if sockType != SOCK_DGRAM && len(p) == 0 {
-			iov.Base = &dummy
-			iov.SetLen(1)
+		if len(p) == 0 {
+			var sockType int
+			sockType, err = GetsockoptInt(fd, SOL_SOCKET, SO_TYPE)
+			if err != nil {
+				return
+			}
+			// receive at least one normal byte
+			if sockType != SOCK_DGRAM {
+				iov.Base = &dummy
+				iov.SetLen(1)
+			}
 		}
 		msg.Control = &oob[0]
 		msg.SetControllen(len(oob))
@@ -591,15 +620,17 @@ func SendmsgN(fd int, p, oob []byte, to Sockaddr, flags int) (n int, err error) 
 	}
 	var dummy byte
 	if len(oob) > 0 {
-		var sockType int
-		sockType, err = GetsockoptInt(fd, SOL_SOCKET, SO_TYPE)
-		if err != nil {
-			return 0, err
-		}
-		// send at least one normal byte
-		if sockType != SOCK_DGRAM && len(p) == 0 {
-			iov.Base = &dummy
-			iov.SetLen(1)
+		if len(p) == 0 {
+			var sockType int
+			sockType, err = GetsockoptInt(fd, SOL_SOCKET, SO_TYPE)
+			if err != nil {
+				return 0, err
+			}
+			// send at least one normal byte
+			if sockType != SOCK_DGRAM {
+				iov.Base = &dummy
+				iov.SetLen(1)
+			}
 		}
 		msg.Control = &oob[0]
 		msg.SetControllen(len(oob))
@@ -820,12 +851,9 @@ func Mount(source string, target string, fstype string, flags uintptr, data stri
 //sysnb	EpollCreate(size int) (fd int, err error)
 //sysnb	EpollCreate1(flag int) (fd int, err error)
 //sysnb	EpollCtl(epfd int, op int, fd int, event *EpollEvent) (err error)
-//sys	EpollWait(epfd int, events []EpollEvent, msec int) (n int, err error)
-//sys	Faccessat(dirfd int, path string, mode uint32, flags int) (err error)
 //sys	Fallocate(fd int, mode uint32, off int64, len int64) (err error)
 //sys	Fchdir(fd int) (err error)
 //sys	Fchmod(fd int, mode uint32) (err error)
-//sys	Fchmodat(dirfd int, path string, mode uint32, flags int) (err error)
 //sys	Fchownat(dirfd int, path string, uid int, gid int, flags int) (err error)
 //sys	fcntl(fd int, cmd int, arg int) (val int, err error)
 //sys	Fdatasync(fd int) (err error)
@@ -920,140 +948,3 @@ func Munmap(b []byte) (err error) {
 //sys	Munlock(b []byte) (err error)
 //sys	Mlockall(flags int) (err error)
 //sys	Munlockall() (err error)
-
-/*
- * Unimplemented
- */
-// AddKey
-// AfsSyscall
-// Alarm
-// ArchPrctl
-// Brk
-// Capget
-// Capset
-// ClockGetres
-// ClockGettime
-// ClockNanosleep
-// ClockSettime
-// Clone
-// CreateModule
-// DeleteModule
-// EpollCtlOld
-// EpollPwait
-// EpollWaitOld
-// Eventfd
-// Execve
-// Fadvise64
-// Fgetxattr
-// Flistxattr
-// Fork
-// Fremovexattr
-// Fsetxattr
-// Futex
-// GetKernelSyms
-// GetMempolicy
-// GetRobustList
-// GetThreadArea
-// Getitimer
-// Getpmsg
-// IoCancel
-// IoDestroy
-// IoGetevents
-// IoSetup
-// IoSubmit
-// Ioctl
-// IoprioGet
-// IoprioSet
-// KexecLoad
-// Keyctl
-// Lgetxattr
-// Llistxattr
-// LookupDcookie
-// Lremovexattr
-// Lsetxattr
-// Mbind
-// MigratePages
-// Mincore
-// ModifyLdt
-// Mount
-// MovePages
-// Mprotect
-// MqGetsetattr
-// MqNotify
-// MqOpen
-// MqTimedreceive
-// MqTimedsend
-// MqUnlink
-// Mremap
-// Msgctl
-// Msgget
-// Msgrcv
-// Msgsnd
-// Msync
-// Newfstatat
-// Nfsservctl
-// Personality
-// Poll
-// Ppoll
-// Prctl
-// Pselect6
-// Ptrace
-// Putpmsg
-// QueryModule
-// Quotactl
-// Readahead
-// Readv
-// RemapFilePages
-// RequestKey
-// RestartSyscall
-// RtSigaction
-// RtSigpending
-// RtSigprocmask
-// RtSigqueueinfo
-// RtSigreturn
-// RtSigsuspend
-// RtSigtimedwait
-// SchedGetPriorityMax
-// SchedGetPriorityMin
-// SchedGetaffinity
-// SchedGetparam
-// SchedGetscheduler
-// SchedRrGetInterval
-// SchedSetaffinity
-// SchedSetparam
-// SchedYield
-// Security
-// Semctl
-// Semget
-// Semop
-// Semtimedop
-// SetMempolicy
-// SetRobustList
-// SetThreadArea
-// SetTidAddress
-// Shmat
-// Shmctl
-// Shmdt
-// Shmget
-// Sigaltstack
-// Signalfd
-// Swapoff
-// Swapon
-// Sysfs
-// TimerCreate
-// TimerDelete
-// TimerGetoverrun
-// TimerGettime
-// TimerSettime
-// Timerfd
-// Tkill (obsolete)
-// Tuxcall
-// Umount2
-// Uselib
-// Utimensat
-// Vfork
-// Vhangup
-// Vmsplice
-// Vserver
-// Waitid
-// _Sysctl
