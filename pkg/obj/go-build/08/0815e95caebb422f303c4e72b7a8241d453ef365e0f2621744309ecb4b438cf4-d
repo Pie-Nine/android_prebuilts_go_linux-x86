@@ -1,9 +1,0 @@
-./build.go
-./fetch.go
-./get.go
-./init.go
-./list.go
-./load.go
-./search.go
-./vendor.go
-./verify.go

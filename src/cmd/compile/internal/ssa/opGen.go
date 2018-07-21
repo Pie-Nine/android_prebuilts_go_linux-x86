@@ -2172,6 +2172,7 @@ const (
 	OpInitMem
 	OpArg
 	OpAddr
+	OpLocalAddr
 	OpSP
 	OpSB
 	OpLoad
@@ -4435,6 +4436,7 @@ var opcodeTable = [...]opInfo{
 		name:           "ADDLmodify",
 		auxType:        auxSymOff,
 		argLen:         3,
+		clobberFlags:   true,
 		faultOnNilArg0: true,
 		symEffect:      SymRead | SymWrite,
 		asm:            x86.AADDL,
@@ -4449,6 +4451,7 @@ var opcodeTable = [...]opInfo{
 		name:           "SUBLmodify",
 		auxType:        auxSymOff,
 		argLen:         3,
+		clobberFlags:   true,
 		faultOnNilArg0: true,
 		symEffect:      SymRead | SymWrite,
 		asm:            x86.ASUBL,
@@ -4463,6 +4466,7 @@ var opcodeTable = [...]opInfo{
 		name:           "ANDLmodify",
 		auxType:        auxSymOff,
 		argLen:         3,
+		clobberFlags:   true,
 		faultOnNilArg0: true,
 		symEffect:      SymRead | SymWrite,
 		asm:            x86.AANDL,
@@ -4477,6 +4481,7 @@ var opcodeTable = [...]opInfo{
 		name:           "ORLmodify",
 		auxType:        auxSymOff,
 		argLen:         3,
+		clobberFlags:   true,
 		faultOnNilArg0: true,
 		symEffect:      SymRead | SymWrite,
 		asm:            x86.AORL,
@@ -4491,6 +4496,7 @@ var opcodeTable = [...]opInfo{
 		name:           "XORLmodify",
 		auxType:        auxSymOff,
 		argLen:         3,
+		clobberFlags:   true,
 		faultOnNilArg0: true,
 		symEffect:      SymRead | SymWrite,
 		asm:            x86.AXORL,
@@ -7956,11 +7962,12 @@ var opcodeTable = [...]opInfo{
 		asm:          x86.ACMOVLNE,
 		reg: regInfo{
 			inputs: []inputInfo{
-				{0, 65519}, // AX CX DX BX BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 65518}, // CX DX BX BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
 				{1, 65519}, // AX CX DX BX BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
 			},
+			clobbers: 1, // AX
 			outputs: []outputInfo{
-				{0, 65519}, // AX CX DX BX BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 65518}, // CX DX BX BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
 			},
 		},
 	},
@@ -8016,11 +8023,12 @@ var opcodeTable = [...]opInfo{
 		asm:          x86.ACMOVWNE,
 		reg: regInfo{
 			inputs: []inputInfo{
-				{0, 65519}, // AX CX DX BX BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 65518}, // CX DX BX BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
 				{1, 65519}, // AX CX DX BX BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
 			},
+			clobbers: 1, // AX
 			outputs: []outputInfo{
-				{0, 65519}, // AX CX DX BX BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
+				{0, 65518}, // CX DX BX BP SI DI R8 R9 R10 R11 R12 R13 R14 R15
 			},
 		},
 	},
@@ -27226,6 +27234,13 @@ var opcodeTable = [...]opInfo{
 		name:      "Addr",
 		auxType:   auxSym,
 		argLen:    1,
+		symEffect: SymAddr,
+		generic:   true,
+	},
+	{
+		name:      "LocalAddr",
+		auxType:   auxSym,
+		argLen:    2,
 		symEffect: SymAddr,
 		generic:   true,
 	},

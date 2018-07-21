@@ -17,11 +17,11 @@ import (
 
 // ref is used to identify a JavaScript value, since the value itself can not be passed to WebAssembly.
 // A JavaScript number (64-bit float, except NaN) is represented by its IEEE 754 binary representation.
-// All other values are represented as an IEEE 754 binary representation of NaN with the low 32 bits
-// used as an ID.
+// All other values are represented as an IEEE 754 binary representation of NaN with bits 0-31 used as
+// an ID and bits 32-33 used to differentiate between string, symbol, function and object.
 type ref uint64
 
-// nanHead are the upper 32 bits of a ref if the value is not a JavaScript number or NaN itself.
+// nanHead are the upper 32 bits of a ref which are set if the value is not a JavaScript number or NaN itself.
 const nanHead = 0x7FF80000
 
 // Value represents a JavaScript value.
@@ -56,14 +56,14 @@ func (e Error) Error() string {
 }
 
 var (
-	valueNaN               = predefValue(0)
-	valueUndefined         = predefValue(1)
-	valueNull              = predefValue(2)
-	valueTrue              = predefValue(3)
-	valueFalse             = predefValue(4)
-	valueGlobal            = predefValue(5)
-	memory                 = predefValue(6) // WebAssembly linear memory
-	resolveCallbackPromise = predefValue(7) // function that the callback helper uses to resume the execution of Go's WebAssembly code
+	valueNaN       = predefValue(0)
+	valueUndefined = predefValue(1)
+	valueNull      = predefValue(2)
+	valueTrue      = predefValue(3)
+	valueFalse     = predefValue(4)
+	valueGlobal    = predefValue(5)
+	memory         = predefValue(6) // WebAssembly linear memory
+	jsGo           = predefValue(7) // instance of the Go class in JavaScript
 )
 
 // Undefined returns the JavaScript value "undefined".
@@ -81,15 +81,25 @@ func Global() Value {
 	return valueGlobal
 }
 
-var uint8Array = valueGlobal.Get("Uint8Array")
-
-// ValueOf returns x as a JavaScript value.
+// ValueOf returns x as a JavaScript value:
+//
+//  | Go                    | JavaScript            |
+//  | --------------------- | --------------------- |
+//  | js.Value              | [its value]           |
+//  | js.TypedArray         | [typed array]         |
+//  | js.Callback           | function              |
+//  | nil                   | null                  |
+//  | bool                  | boolean               |
+//  | integers and floats   | number                |
+//  | string                | string                |
 func ValueOf(x interface{}) Value {
 	switch x := x.(type) {
 	case Value:
 		return x
+	case TypedArray:
+		return x.Value
 	case Callback:
-		return x.enqueueFn
+		return x.Value
 	case nil:
 		return valueNull
 	case bool:
@@ -128,17 +138,76 @@ func ValueOf(x interface{}) Value {
 		return floatValue(x)
 	case string:
 		return makeValue(stringVal(x))
-	case []byte:
-		if len(x) == 0 {
-			return uint8Array.New(memory.Get("buffer"), 0, 0)
-		}
-		return uint8Array.New(memory.Get("buffer"), unsafe.Pointer(&x[0]), len(x))
 	default:
-		panic("invalid value")
+		panic("ValueOf: invalid value")
 	}
 }
 
 func stringVal(x string) ref
+
+// Type represents the JavaScript type of a Value.
+type Type int
+
+const (
+	TypeUndefined Type = iota
+	TypeNull
+	TypeBoolean
+	TypeNumber
+	TypeString
+	TypeSymbol
+	TypeObject
+	TypeFunction
+)
+
+func (t Type) String() string {
+	switch t {
+	case TypeUndefined:
+		return "undefined"
+	case TypeNull:
+		return "null"
+	case TypeBoolean:
+		return "boolean"
+	case TypeNumber:
+		return "number"
+	case TypeString:
+		return "string"
+	case TypeSymbol:
+		return "symbol"
+	case TypeObject:
+		return "object"
+	case TypeFunction:
+		return "function"
+	default:
+		panic("bad type")
+	}
+}
+
+// Type returns the JavaScript type of the value v. It is similar to JavaScript's typeof operator,
+// except that it returns TypeNull instead of TypeObject for null.
+func (v Value) Type() Type {
+	switch v.ref {
+	case valueUndefined.ref:
+		return TypeUndefined
+	case valueNull.ref:
+		return TypeNull
+	case valueTrue.ref, valueFalse.ref:
+		return TypeBoolean
+	}
+	if v.isNumber() {
+		return TypeNumber
+	}
+	typeFlag := v.ref >> 32 & 3
+	switch typeFlag {
+	case 1:
+		return TypeString
+	case 2:
+		return TypeSymbol
+	case 3:
+		return TypeFunction
+	default:
+		return TypeObject
+	}
+}
 
 // Get returns the JavaScript property p of value v.
 func (v Value) Get(p string) Value {
@@ -188,6 +257,12 @@ func valueLength(v ref) int
 func (v Value) Call(m string, args ...interface{}) Value {
 	res, ok := valueCall(v.ref, m, makeArgs(args))
 	if !ok {
+		if vType := v.Type(); vType != TypeObject && vType != TypeFunction { // check here to avoid overhead in success case
+			panic(&ValueError{"Value.Call", vType})
+		}
+		if propType := v.Get(m).Type(); propType != TypeFunction {
+			panic("syscall/js: Value.Call: property " + m + " is not a function, got " + propType.String())
+		}
 		panic(Error{makeValue(res)})
 	}
 	return makeValue(res)
@@ -200,6 +275,9 @@ func valueCall(v ref, m string, args []ref) (ref, bool)
 func (v Value) Invoke(args ...interface{}) Value {
 	res, ok := valueInvoke(v.ref, makeArgs(args))
 	if !ok {
+		if vType := v.Type(); vType != TypeFunction { // check here to avoid overhead in success case
+			panic(&ValueError{"Value.Invoke", vType})
+		}
 		panic(Error{makeValue(res)})
 	}
 	return makeValue(res)
@@ -220,20 +298,24 @@ func (v Value) New(args ...interface{}) Value {
 func valueNew(v ref, args []ref) (ref, bool)
 
 func (v Value) isNumber() bool {
-	return v.ref>>32 != nanHead || v.ref == valueNaN.ref
+	return v.ref>>32&nanHead != nanHead || v.ref == valueNaN.ref
 }
 
-// Float returns the value v as a float64. It panics if v is not a JavaScript number.
-func (v Value) Float() float64 {
+func (v Value) float(method string) float64 {
 	if !v.isNumber() {
-		panic("syscall/js: not a number")
+		panic(&ValueError{method, v.Type()})
 	}
 	return *(*float64)(unsafe.Pointer(&v.ref))
 }
 
+// Float returns the value v as a float64. It panics if v is not a JavaScript number.
+func (v Value) Float() float64 {
+	return v.float("Value.Float")
+}
+
 // Int returns the value v truncated to an int. It panics if v is not a JavaScript number.
 func (v Value) Int() int {
-	return int(v.Float())
+	return int(v.float("Value.Int"))
 }
 
 // Bool returns the value v as a bool. It panics if v is not a JavaScript boolean.
@@ -244,7 +326,7 @@ func (v Value) Bool() bool {
 	case valueFalse.ref:
 		return false
 	default:
-		panic("syscall/js: not a boolean")
+		panic(&ValueError{"Value.Bool", v.Type()})
 	}
 }
 
@@ -266,3 +348,15 @@ func (v Value) InstanceOf(t Value) bool {
 }
 
 func valueInstanceOf(v ref, t ref) bool
+
+// A ValueError occurs when a Value method is invoked on
+// a Value that does not support it. Such cases are documented
+// in the description of each method.
+type ValueError struct {
+	Method string
+	Type   Type
+}
+
+func (e *ValueError) Error() string {
+	return "syscall/js: call of " + e.Method + " on " + e.Type.String()
+}

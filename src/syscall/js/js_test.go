@@ -53,6 +53,12 @@ func TestString(t *testing.T) {
 	if dummys.Get("someString") != dummys.Get("someString") {
 		t.Errorf("same value not equal")
 	}
+
+	wantInt := "42"
+	o = dummys.Get("someInt")
+	if got := o.String(); got != wantInt {
+		t.Errorf("got %#v, want %#v", got, wantInt)
+	}
 }
 
 func TestInt(t *testing.T) {
@@ -107,6 +113,43 @@ func TestObject(t *testing.T) {
 	if dummys.Get("someArray") != dummys.Get("someArray") {
 		t.Errorf("same value not equal")
 	}
+
+	// An object and its prototype should not be equal.
+	proto := js.Global().Get("Object").Get("prototype")
+	o := js.Global().Call("eval", "new Object()")
+	if proto == o {
+		t.Errorf("object equals to its prototype")
+	}
+}
+
+func TestFrozenObject(t *testing.T) {
+	o := js.Global().Call("eval", "(function () { let o = new Object(); o.field = 5; Object.freeze(o); return o; })()")
+	want := 5
+	if got := o.Get("field").Int(); want != got {
+		t.Errorf("got %#v, want %#v", got, want)
+	}
+}
+
+func TestTypedArrayOf(t *testing.T) {
+	testTypedArrayOf(t, "[]int8", []int8{0, -42, 0}, -42)
+	testTypedArrayOf(t, "[]int16", []int16{0, -42, 0}, -42)
+	testTypedArrayOf(t, "[]int32", []int32{0, -42, 0}, -42)
+	testTypedArrayOf(t, "[]uint8", []uint8{0, 42, 0}, 42)
+	testTypedArrayOf(t, "[]uint16", []uint16{0, 42, 0}, 42)
+	testTypedArrayOf(t, "[]uint32", []uint32{0, 42, 0}, 42)
+	testTypedArrayOf(t, "[]float32", []float32{0, -42.5, 0}, -42.5)
+	testTypedArrayOf(t, "[]float64", []float64{0, -42.5, 0}, -42.5)
+}
+
+func testTypedArrayOf(t *testing.T, name string, slice interface{}, want float64) {
+	t.Run(name, func(t *testing.T) {
+		a := js.TypedArrayOf(slice)
+		got := a.Index(1).Float()
+		a.Release()
+		if got != want {
+			t.Errorf("got %#v, want %#v", got, want)
+		}
+	})
 }
 
 func TestNaN(t *testing.T) {
@@ -184,6 +227,33 @@ func TestInstanceOf(t *testing.T) {
 	}
 }
 
+func TestType(t *testing.T) {
+	if got, want := js.Undefined().Type(), js.TypeUndefined; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+	if got, want := js.Null().Type(), js.TypeNull; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+	if got, want := js.ValueOf(true).Type(), js.TypeBoolean; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+	if got, want := js.ValueOf(42).Type(), js.TypeNumber; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+	if got, want := js.ValueOf("test").Type(), js.TypeString; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+	if got, want := js.Global().Get("Symbol").Invoke("test").Type(), js.TypeSymbol; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+	if got, want := js.Global().Get("Array").New().Type(), js.TypeObject; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+	if got, want := js.Global().Get("Array").Type(), js.TypeFunction; got != want {
+		t.Errorf("got %s, want %s", got, want)
+	}
+}
+
 func TestCallback(t *testing.T) {
 	c := make(chan struct{})
 	cb := js.NewCallback(func(args []js.Value) {
@@ -192,7 +262,7 @@ func TestCallback(t *testing.T) {
 		}
 		c <- struct{}{}
 	})
-	defer cb.Close()
+	defer cb.Release()
 	js.Global().Call("setTimeout", cb, 0, 42)
 	<-c
 }
@@ -212,10 +282,10 @@ func TestEventCallback(t *testing.T) {
 		cb := js.NewEventCallback(flags, func(event js.Value) {
 			c <- struct{}{}
 		})
-		defer cb.Close()
+		defer cb.Release()
 
 		event := js.Global().Call("eval", fmt.Sprintf("({ called: false, %s: function() { this.called = true; } })", name))
-		js.ValueOf(cb).Invoke(event)
+		cb.Invoke(event)
 		if !event.Get("called").Bool() {
 			t.Errorf("%s not called", name)
 		}
@@ -228,7 +298,7 @@ func ExampleNewCallback() {
 	var cb js.Callback
 	cb = js.NewCallback(func(args []js.Value) {
 		fmt.Println("button clicked")
-		cb.Close() // close the callback if the button will not be clicked again
+		cb.Release() // release the callback if the button will not be clicked again
 	})
 	js.Global().Get("document").Call("getElementById", "myButton").Call("addEventListener", "click", cb)
 }

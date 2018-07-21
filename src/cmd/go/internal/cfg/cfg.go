@@ -21,6 +21,7 @@ var (
 	BuildA                 bool   // -a flag
 	BuildBuildmode         string // -buildmode flag
 	BuildContext           = build.Default
+	BuildGetmode           string             // -getmode flag
 	BuildI                 bool               // -i flag
 	BuildLinkshared        bool               // -linkshared flag
 	BuildMSan              bool               // -msan flag
@@ -67,6 +68,16 @@ var (
 	Goos      = BuildContext.GOOS
 	ExeSuffix string
 	Gopath    = filepath.SplitList(BuildContext.GOPATH)
+
+	// ModulesEnabled specifies whether the go command is running
+	// in module-aware mode (as opposed to GOPATH mode).
+	// It is equal to modload.Enabled, but not all packages can import modload.
+	ModulesEnabled bool
+
+	// GoModInGOPATH records whether we've found a go.mod in GOPATH/src
+	// in GO111MODULE=auto mode. In that case, we don't use modules
+	// but people might expect us to, so 'go get' warns.
+	GoModInGOPATH string
 )
 
 func init() {

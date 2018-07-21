@@ -60,7 +60,9 @@ func (t *Transport) RoundTrip(req *Request) (*Response, error) {
 			return nil, err
 		}
 		req.Body.Close()
-		opt.Set("body", body)
+		a := js.TypedArrayOf(body)
+		defer a.Release()
+		opt.Set("body", a)
 	}
 	respPromise := js.Global().Call("fetch", req.URL.String(), opt)
 	var (
@@ -110,7 +112,7 @@ func (t *Transport) RoundTrip(req *Request) (*Response, error) {
 		case <-req.Context().Done():
 		}
 	})
-	defer success.Close()
+	defer success.Release()
 	failure := js.NewCallback(func(args []js.Value) {
 		err := fmt.Errorf("net/http: fetch() failed: %s", args[0].String())
 		select {
@@ -118,7 +120,7 @@ func (t *Transport) RoundTrip(req *Request) (*Response, error) {
 		case <-req.Context().Done():
 		}
 	})
-	defer failure.Close()
+	defer failure.Release()
 	respPromise.Call("then", success, failure)
 	select {
 	case <-req.Context().Done():
@@ -166,10 +168,12 @@ func (r *streamReader) Read(p []byte) (n int, err error) {
 				return
 			}
 			value := make([]byte, result.Get("value").Get("byteLength").Int())
-			js.ValueOf(value).Call("set", result.Get("value"))
+			a := js.TypedArrayOf(value)
+			a.Call("set", result.Get("value"))
+			a.Release()
 			bCh <- value
 		})
-		defer success.Close()
+		defer success.Release()
 		failure := js.NewCallback(func(args []js.Value) {
 			// Assumes it's a TypeError. See
 			// https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/TypeError
@@ -178,7 +182,7 @@ func (r *streamReader) Read(p []byte) (n int, err error) {
 			// the read method.
 			errCh <- errors.New(args[0].Get("message").String())
 		})
-		defer failure.Close()
+		defer failure.Release()
 		r.stream.Call("read").Call("then", success, failure)
 		select {
 		case b := <-bCh:
@@ -227,10 +231,12 @@ func (r *arrayReader) Read(p []byte) (n int, err error) {
 			// Wrap the input ArrayBuffer with a Uint8Array
 			uint8arrayWrapper := js.Global().Get("Uint8Array").New(args[0])
 			value := make([]byte, uint8arrayWrapper.Get("byteLength").Int())
-			js.ValueOf(value).Call("set", uint8arrayWrapper)
+			a := js.TypedArrayOf(value)
+			a.Call("set", uint8arrayWrapper)
+			a.Release()
 			bCh <- value
 		})
-		defer success.Close()
+		defer success.Release()
 		failure := js.NewCallback(func(args []js.Value) {
 			// Assumes it's a TypeError. See
 			// https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/TypeError
@@ -238,7 +244,7 @@ func (r *arrayReader) Read(p []byte) (n int, err error) {
 			// See https://fetch.spec.whatwg.org/#concept-body-consume-body for reasons this might error.
 			errCh <- errors.New(args[0].Get("message").String())
 		})
-		defer failure.Close()
+		defer failure.Release()
 		r.arrayPromise.Call("then", success, failure)
 		select {
 		case b := <-bCh:

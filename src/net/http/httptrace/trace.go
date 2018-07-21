@@ -142,8 +142,13 @@ type ClientTrace struct {
 	// failure.
 	TLSHandshakeDone func(tls.ConnectionState, error)
 
+	// WroteHeaderField is called after the Transport has written
+	// each request header. At the time of this call the values
+	// might be buffered and not yet written to the network.
+	WroteHeaderField func(key string, value []string)
+
 	// WroteHeaders is called after the Transport has written
-	// the request headers.
+	// all request headers.
 	WroteHeaders func()
 
 	// Wait100Continue is called if the Request specified
