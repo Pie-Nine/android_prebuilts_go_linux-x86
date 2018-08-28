@@ -25,15 +25,21 @@ var (
 )
 
 func isStandardImportPath(path string) bool {
+	return findStandardImportPath(path) != ""
+}
+
+func findStandardImportPath(path string) string {
 	if search.IsStandardImportPath(path) {
-		if _, err := os.Stat(filepath.Join(cfg.GOROOT, "src", path)); err == nil {
-			return true
+		dir := filepath.Join(cfg.GOROOT, "src", path)
+		if _, err := os.Stat(dir); err == nil {
+			return dir
 		}
-		if _, err := os.Stat(filepath.Join(cfg.GOROOT, "src/vendor", path)); err == nil {
-			return true
+		dir = filepath.Join(cfg.GOROOT, "src/vendor", path)
+		if _, err := os.Stat(dir); err == nil {
+			return dir
 		}
 	}
-	return false
+	return ""
 }
 
 func PackageModuleInfo(pkgpath string) *modinfo.ModulePublic {
@@ -86,12 +92,17 @@ func addVersions(m *modinfo.ModulePublic) {
 
 func moduleInfo(m module.Version, fromBuildList bool) *modinfo.ModulePublic {
 	if m == Target {
-		return &modinfo.ModulePublic{
+		info := &modinfo.ModulePublic{
 			Path:    m.Path,
 			Version: m.Version,
 			Main:    true,
 			Dir:     ModRoot,
+			GoMod:   filepath.Join(ModRoot, "go.mod"),
 		}
+		if modFile.Go != nil {
+			info.GoVersion = modFile.Go.Version
+		}
+		return info
 	}
 
 	info := &modinfo.ModulePublic{
@@ -99,8 +110,11 @@ func moduleInfo(m module.Version, fromBuildList bool) *modinfo.ModulePublic {
 		Version:  m.Version,
 		Indirect: fromBuildList && loaded != nil && !loaded.direct[m.Path],
 	}
+	if loaded != nil {
+		info.GoVersion = loaded.goVersion[m.Path]
+	}
 
-	if cfg.BuildGetmode == "vendor" {
+	if cfg.BuildMod == "vendor" {
 		info.Dir = filepath.Join(ModRoot, "vendor", m.Path)
 		return info
 	}
@@ -114,35 +128,47 @@ func moduleInfo(m module.Version, fromBuildList bool) *modinfo.ModulePublic {
 				m.Version = q.Version
 				m.Time = &q.Time
 			}
-			dir, err := modfetch.DownloadDir(module.Version{Path: m.Path, Version: m.Version})
+
+			mod := module.Version{Path: m.Path, Version: m.Version}
+			gomod, err := modfetch.CachePath(mod, "mod")
+			if err == nil {
+				if info, err := os.Stat(gomod); err == nil && info.Mode().IsRegular() {
+					m.GoMod = gomod
+				}
+			}
+			dir, err := modfetch.DownloadDir(mod)
 			if err == nil {
 				if info, err := os.Stat(dir); err == nil && info.IsDir() {
 					m.Dir = dir
 				}
 			}
 		}
-		if cfg.BuildGetmode == "vendor" {
+		if cfg.BuildMod == "vendor" {
 			m.Dir = filepath.Join(ModRoot, "vendor", m.Path)
 		}
 	}
 
 	complete(info)
 
-	if r := Replacement(m); r.Path != "" {
-		info.Replace = &modinfo.ModulePublic{
-			Path:    r.Path,
-			Version: r.Version,
-		}
-		if r.Version == "" {
-			if filepath.IsAbs(r.Path) {
-				info.Replace.Dir = r.Path
-			} else {
-				info.Replace.Dir = filepath.Join(ModRoot, r.Path)
+	if fromBuildList {
+		if r := Replacement(m); r.Path != "" {
+			info.Replace = &modinfo.ModulePublic{
+				Path:      r.Path,
+				Version:   r.Version,
+				GoVersion: info.GoVersion,
 			}
+			if r.Version == "" {
+				if filepath.IsAbs(r.Path) {
+					info.Replace.Dir = r.Path
+				} else {
+					info.Replace.Dir = filepath.Join(ModRoot, r.Path)
+				}
+			}
+			complete(info.Replace)
+			info.Dir = info.Replace.Dir
+			info.GoMod = filepath.Join(info.Dir, "go.mod")
+			info.Error = nil // ignore error loading original module version (it has been replaced)
 		}
-		complete(info.Replace)
-		info.Dir = info.Replace.Dir
-		info.Error = nil // ignore error loading original module version (it has been replaced)
 	}
 
 	return info

@@ -143,7 +143,7 @@ func CheckPath(path string) error {
 		}
 	}
 	if _, _, ok := SplitPathVersion(path); !ok {
-		return fmt.Errorf("malformed module path %q: invalid version %s", path, path[strings.LastIndex(path, "/")+1:])
+		return fmt.Errorf("malformed module path %q: invalid version", path)
 	}
 	return nil
 }
@@ -300,6 +300,9 @@ func splitGopkgIn(path string) (prefix, pathMajor string, ok bool) {
 		return path, "", false
 	}
 	i := len(path)
+	if strings.HasSuffix(path, "-unstable") {
+		i -= len("-unstable")
+	}
 	for i > 0 && ('0' <= path[i-1] && path[i-1] <= '9') {
 		i--
 	}
@@ -317,6 +320,9 @@ func splitGopkgIn(path string) (prefix, pathMajor string, ok bool) {
 // MatchPathMajor reports whether the semantic version v
 // matches the path major version pathMajor.
 func MatchPathMajor(v, pathMajor string) bool {
+	if strings.HasPrefix(pathMajor, ".v") && strings.HasSuffix(pathMajor, "-unstable") {
+		pathMajor = strings.TrimSuffix(pathMajor, "-unstable")
+	}
 	if strings.HasPrefix(v, "v0.0.0-") && pathMajor == ".v1" {
 		// Allow old bug in pseudo-versions that generated v0.0.0- pseudoversion for gopkg .v1.
 		// For example, gopkg.in/yaml.v2@v2.2.1's go.mod requires gopkg.in/check.v1 v0.0.0-20161208181325-20d25e280405.
@@ -433,8 +439,22 @@ func EncodePath(path string) (encoding string, err error) {
 		return "", err
 	}
 
+	return encodeString(path)
+}
+
+// EncodeVersion returns the safe encoding of the given module version.
+// Versions are allowed to be in non-semver form but must be valid file names
+// and not contain exclamation marks.
+func EncodeVersion(v string) (encoding string, err error) {
+	if err := checkElem(v, true); err != nil || strings.Contains(v, "!") {
+		return "", fmt.Errorf("disallowed version string %q", v)
+	}
+	return encodeString(v)
+}
+
+func encodeString(s string) (encoding string, err error) {
 	haveUpper := false
-	for _, r := range path {
+	for _, r := range s {
 		if r == '!' || r >= utf8.RuneSelf {
 			// This should be disallowed by CheckPath, but diagnose anyway.
 			// The correctness of the encoding loop below depends on it.
@@ -446,11 +466,11 @@ func EncodePath(path string) (encoding string, err error) {
 	}
 
 	if !haveUpper {
-		return path, nil
+		return s, nil
 	}
 
 	var buf []byte
-	for _, r := range path {
+	for _, r := range s {
 		if 'A' <= r && r <= 'Z' {
 			buf = append(buf, '!', byte(r+'a'-'A'))
 		} else {
@@ -461,19 +481,45 @@ func EncodePath(path string) (encoding string, err error) {
 }
 
 // DecodePath returns the module path of the given safe encoding.
-// It fails if the encoding is invalid.
+// It fails if the encoding is invalid or encodes an invalid path.
 func DecodePath(encoding string) (path string, err error) {
+	path, ok := decodeString(encoding)
+	if !ok {
+		return "", fmt.Errorf("invalid module path encoding %q", encoding)
+	}
+	if err := CheckPath(path); err != nil {
+		return "", fmt.Errorf("invalid module path encoding %q: %v", encoding, err)
+	}
+	return path, nil
+}
+
+// DecodeVersion returns the version string for the given safe encoding.
+// It fails if the encoding is invalid or encodes an invalid version.
+// Versions are allowed to be in non-semver form but must be valid file names
+// and not contain exclamation marks.
+func DecodeVersion(encoding string) (v string, err error) {
+	v, ok := decodeString(encoding)
+	if !ok {
+		return "", fmt.Errorf("invalid version encoding %q", encoding)
+	}
+	if err := checkElem(v, true); err != nil {
+		return "", fmt.Errorf("disallowed version string %q", v)
+	}
+	return v, nil
+}
+
+func decodeString(encoding string) (string, bool) {
 	var buf []byte
 
 	bang := false
 	for _, r := range encoding {
 		if r >= utf8.RuneSelf {
-			goto BadEncoding
+			return "", false
 		}
 		if bang {
 			bang = false
 			if r < 'a' || 'z' < r {
-				goto BadEncoding
+				return "", false
 			}
 			buf = append(buf, byte(r+'A'-'a'))
 			continue
@@ -483,19 +529,12 @@ func DecodePath(encoding string) (path string, err error) {
 			continue
 		}
 		if 'A' <= r && r <= 'Z' {
-			goto BadEncoding
+			return "", false
 		}
 		buf = append(buf, byte(r))
 	}
 	if bang {
-		goto BadEncoding
+		return "", false
 	}
-	path = string(buf)
-	if err := CheckPath(path); err != nil {
-		return "", fmt.Errorf("invalid module path encoding %q: %v", encoding, err)
-	}
-	return path, nil
-
-BadEncoding:
-	return "", fmt.Errorf("invalid module path encoding %q", encoding)
+	return string(buf), true
 }
